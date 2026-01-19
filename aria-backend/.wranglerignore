@@ -1,0 +1,51 @@
+# Dependencies - Wrangler bundles your code automatically
+node_modules/
+
+# Source files - only the built bundle is needed
+src/
+test/
+
+# Configuration files
+tsconfig.json
+tsconfig.*.json
+vitest.config.mts
+package-lock.json
+
+# Documentation
+*.md
+SETUP.md
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Git
+.git/
+.gitignore
+
+# Test coverage
+coverage/
+
+# Build artifacts (if any)
+dist/
+build/
+
+# Log files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files (should use wrangler secrets instead)
+.env
+.env.local
+.env.*.local
+
