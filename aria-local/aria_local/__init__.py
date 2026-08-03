@@ -1,0 +1,1 @@
+"""Local ARIA processing service."""

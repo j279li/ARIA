@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aria-local"
+version = "0.1.0"
+description = "Local manga OCR, translation, cleanup, and typesetting service"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "numpy>=2,<3",
+    "opencv-python-headless>=4.10,<5",
+    "pillow>=11,<13",
+    "pytesseract>=0.3.13,<1",
+    "python-multipart>=0.0.20,<1",
+    "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8,<9",
+]
+manga-ocr = [
+    "manga-ocr>=0.1.11,<1",
+]
+paddleocr = [
+    "paddleocr>=3,<4",
+]
+argos = [
+    "argostranslate>=1.11,<2",
+]
+helsinki = [
+    "sentencepiece>=0.2,<1",
+]
+providers = [
+    "manga-ocr>=0.1.11,<1",
+    "paddleocr>=3,<4",
+    "argostranslate>=1.11,<2",
+]
+
+[tool.setuptools.packages.find]
+include = ["aria_local*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
