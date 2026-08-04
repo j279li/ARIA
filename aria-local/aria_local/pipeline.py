@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
-import shutil
-from typing import Sequence
 
 import cv2
 import httpx
@@ -13,10 +13,12 @@ import numpy as np
 import pytesseract
 from PIL import Image, ImageDraw, ImageFont
 
+from .bubbles import WhiteBubbleLocator
+from .bubbles import polygon_geometry_mask as _polygon_geometry_mask
 from .models import ManualInpaintRegion, PipelineOptions, Point, TextRegion
 from .providers import (
-    DetectedRegion,
     ArgosTranslationProvider,
+    DetectedRegion,
     HelsinkiTranslationProvider,
     MangaOCRRecognizer,
     OCRResult,
@@ -213,18 +215,22 @@ class TesseractDetector:
 
     def detect(self, image_path: str, options: PipelineOptions) -> list[DetectedRegion]:
         regions = _extract_regions(Path(image_path), options)
-        return group_detected_regions([
-            DetectedRegion(
-                polygon=region.polygon,
-                bbox=region.bbox,
-                detector_confidence=region.detector_confidence,
-                orientation=region.orientation,
-                source_text=region.source_text,
-                recognition_confidence=region.recognition_confidence,
-                segmentation=[region.polygon],
-            )
-            for region in regions
-        ])
+        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        return group_detected_regions(
+            [
+                DetectedRegion(
+                    polygon=region.polygon,
+                    bbox=region.bbox,
+                    detector_confidence=region.detector_confidence,
+                    orientation=region.orientation,
+                    source_text=region.source_text,
+                    recognition_confidence=region.recognition_confidence,
+                    segmentation=[region.polygon],
+                )
+                for region in regions
+            ],
+            image=image,
+        )
 
 
 class TesseractRecognizer:
@@ -307,15 +313,24 @@ def _is_japanese_character(character: str) -> bool:
 def _assign_manga_reading_order(regions: list[TextRegion]) -> None:
     if not regions:
         return
-    regions.sort(key=lambda region: (region.bbox[0], region.bbox[1]))
+    regions.sort(
+        key=lambda region: (
+            region.bbox[1],
+            -region.bbox[0],
+            -region.bbox[3],
+            -region.bbox[2],
+            region.id,
+        )
+    )
     rows: list[list[TextRegion]] = []
     for region in regions:
         placed = False
         for row in rows:
             first = row[0]
-            first_bottom = first.bbox[1] + first.bbox[3]
+            region_center = region.bbox[1] + region.bbox[3] / 2
+            row_center = first.bbox[1] + first.bbox[3] / 2
             if (
-                abs(region.bbox[1] - first.bbox[1])
+                abs(region_center - row_center)
                 < max(first.bbox[3], region.bbox[3]) * 0.6
             ):
                 row.append(region)
@@ -324,12 +339,21 @@ def _assign_manga_reading_order(regions: list[TextRegion]) -> None:
         if not placed:
             rows.append([region])
 
-    reading_order = 1
+    ordered: list[TextRegion] = []
     for row in rows:
-        row.sort(key=lambda region: -region.bbox[0])
-        for region in row:
-            region.reading_order = reading_order
-            reading_order += 1
+        row.sort(
+            key=lambda region: (
+                -region.bbox[0],
+                region.bbox[1],
+                -region.bbox[3],
+                -region.bbox[2],
+                region.id,
+            )
+        )
+        ordered.extend(row)
+    regions[:] = ordered
+    for reading_order, region in enumerate(regions, start=1):
+        region.reading_order = reading_order
 
 
 def _normalize_ocr_text(text: str) -> str:
@@ -392,11 +416,15 @@ def _translate_regions(
             timeout=60,
         )
         if not response.is_success:
-            raise PipelineError(f"DeepL request failed with status {response.status_code}")
+            raise PipelineError(
+                f"DeepL request failed with status {response.status_code}"
+            )
 
         payload = response.json()
         raw_translations = payload.get("translations")
-        if not isinstance(raw_translations, list) or len(raw_translations) != len(batch):
+        if not isinstance(raw_translations, list) or len(raw_translations) != len(
+            batch
+        ):
             raise PipelineError("DeepL returned an unexpected translation count")
         for item in raw_translations:
             if not isinstance(item, dict) or not isinstance(item.get("text"), str):
@@ -412,24 +440,37 @@ def _font_candidates(explicit_path: str | None) -> list[str]:
         os.getenv("ARIA_FONT_PATH"),
         "C:/Windows/Fonts/arial.ttf",
         "C:/Windows/Fonts/calibri.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
     ]
-    return [candidate for candidate in candidates if candidate]
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
 @lru_cache(maxsize=256)
-def _load_font(size: int, explicit_path: str | None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _load_font(
+    size: int, explicit_path: str | None
+) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for candidate in _font_candidates(explicit_path):
         try:
             return ImageFont.truetype(candidate, size=size)
         except OSError:
             continue
-    return ImageFont.load_default()
+    return ImageFont.load_default(size=size)
 
 
-def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, width: int) -> str:
+def _wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    width: int,
+    stroke_width: int = 0,
+) -> str:
     def text_width(value: str) -> int:
-        return draw.textbbox((0, 0), value, font=font)[2]
+        bounds = draw.textbbox((0, 0), value, font=font, stroke_width=stroke_width)
+        return bounds[2] - bounds[0]
 
     def wrap_characters(value: str) -> list[str]:
         lines: list[str] = []
@@ -445,30 +486,50 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, 
             lines.append(current)
         return lines
 
+    def balance(lines: list[str]) -> list[str]:
+        for index in range(len(lines) - 1):
+            words = lines[index].split()
+            while len(words) > 1:
+                next_line = f"{words[-1]} {lines[index + 1]}".strip()
+                shortened = " ".join(words[:-1])
+                if text_width(next_line) > width or max(
+                    text_width(shortened), text_width(next_line)
+                ) >= max(text_width(lines[index]), text_width(lines[index + 1])):
+                    break
+                lines[index] = shortened
+                lines[index + 1] = next_line
+                words.pop()
+        return lines
+
     wrapped_lines: list[str] = []
     for paragraph in text.splitlines() or [text]:
+        if text_width(paragraph) <= width:
+            wrapped_lines.append(paragraph)
+            continue
         if " " not in paragraph.strip():
-            if paragraph and all(character.isascii() for character in paragraph):
-                # Keep short English words intact so auto-fit reduces the font
-                # instead of producing awkward splits such as "Fun" / "ny".
-                wrapped_lines.append(paragraph)
-            else:
-                wrapped_lines.extend(wrap_characters(paragraph))
+            wrapped_lines.extend(wrap_characters(paragraph))
             continue
 
+        paragraph_lines: list[str] = []
         current = ""
         for word in paragraph.split():
+            if text_width(word) > width:
+                if current:
+                    paragraph_lines.append(current)
+                    current = ""
+                chunks = wrap_characters(word)
+                paragraph_lines.extend(chunks[:-1])
+                current = chunks[-1]
+                continue
             candidate = f"{current} {word}".strip()
             if current and text_width(candidate) > width:
-                wrapped_lines.append(current)
+                paragraph_lines.append(current)
                 current = word
-            elif not current and text_width(word) > width:
-                wrapped_lines.extend(wrap_characters(word))
-                current = ""
             else:
                 current = candidate
         if current:
-            wrapped_lines.append(current)
+            paragraph_lines.append(current)
+        wrapped_lines.extend(balance(paragraph_lines))
     return "\n".join(wrapped_lines)
 
 
@@ -477,6 +538,32 @@ def _default_render_bbox(
 ) -> tuple[int, int, int, int]:
     image_width, image_height = image_size
     x, y, width, height = region.bbox
+
+    bubble_text_bbox = _metadata_bbox(region.detector_metadata.get("bubble_text_bbox"))
+    if bubble_text_bbox is not None:
+        text_x, text_y, text_width, text_height = bubble_text_bbox
+        left = max(0, text_x)
+        top = max(0, text_y)
+        right = min(image_width, text_x + text_width)
+        bottom = min(image_height, text_y + text_height)
+        if right - left >= 8 and bottom - top >= 8:
+            return left, top, right - left, bottom - top
+
+    bubble_bbox = _metadata_bbox(region.detector_metadata.get("bubble_bbox"))
+    if bubble_bbox is not None:
+        bubble_x, bubble_y, bubble_width, bubble_height = bubble_bbox
+        left = max(0, bubble_x)
+        top = max(0, bubble_y)
+        right = min(image_width, bubble_x + bubble_width)
+        bottom = min(image_height, bubble_y + bubble_height)
+        margin = max(2, round(min(right - left, bottom - top) * 0.04))
+        if right - left > margin * 2 + 8 and bottom - top > margin * 2 + 8:
+            return (
+                left + margin,
+                top + margin,
+                right - left - margin * 2,
+                bottom - top - margin * 2,
+            )
 
     # Use segmentation polygons (the individual line boxes from the detector)
     # to get a tighter estimate of where text sits within the bubble.
@@ -502,9 +589,98 @@ def _default_render_bbox(
     target_height = min(target_height, image_height)
     center_x = seg_x + seg_w / 2
     center_y = seg_y + seg_h / 2
-    left = max(0, min(int(round(center_x - target_width / 2)), image_width - target_width))
-    top = max(0, min(int(round(center_y - target_height / 2)), image_height - target_height))
+    left = max(0, min(round(center_x - target_width / 2), image_width - target_width))
+    top = max(0, min(round(center_y - target_height / 2), image_height - target_height))
     return left, top, target_width, target_height
+
+
+def _fit_text_layout(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_path: str | None,
+    width: int,
+    height: int,
+    requested_size: int | None = None,
+) -> tuple[ImageFont.ImageFont, str, tuple[int, int, int, int], int] | None:
+    minimum_size = 6
+    selected: tuple[ImageFont.ImageFont, str, tuple[int, int, int, int], int] | None = (
+        None
+    )
+    measured: dict[
+        int, tuple[ImageFont.ImageFont, str, tuple[int, int, int, int], int]
+    ] = {}
+
+    def measure(
+        size: int,
+    ) -> tuple[ImageFont.ImageFont, str, tuple[int, int, int, int], int]:
+        if size not in measured:
+            font = _load_font(size, font_path)
+            wrapped = _wrap_text(draw, text, font, width, stroke_width=1)
+            spacing = max(1, round(size * 0.12))
+            bounds = draw.multiline_textbbox(
+                (0, 0),
+                wrapped,
+                font=font,
+                spacing=spacing,
+                align="center",
+                stroke_width=1,
+            )
+            measured[size] = font, wrapped, bounds, spacing
+        return measured[size]
+
+    def fits(
+        layout: tuple[ImageFont.ImageFont, str, tuple[int, int, int, int], int],
+    ) -> bool:
+        bounds = layout[2]
+        return bounds[2] - bounds[0] <= width and bounds[3] - bounds[1] <= height
+
+    maximum_size = requested_size or max(width, height)
+    if requested_size is None:
+        while maximum_size < 8192 and fits(measure(maximum_size)):
+            maximum_size *= 2
+
+    low, high = minimum_size, max(minimum_size, maximum_size)
+    while low <= high:
+        size = (low + high) // 2
+        candidate = measure(size)
+        if fits(candidate):
+            selected = candidate
+            low = size + 1
+        else:
+            high = size - 1
+    return selected
+
+
+def _metadata_bbox(value: object) -> tuple[int, int, int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    if not all(isinstance(item, (int, float)) for item in value):
+        return None
+    x, y, width, height = (round(item) for item in value)
+    if width <= 0 or height <= 0:
+        return None
+    return x, y, width, height
+
+
+def _metadata_contour(value: object) -> tuple[tuple[int, int], ...] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    points: list[tuple[int, int]] = []
+    for point in value:
+        if (
+            not isinstance(point, (list, tuple))
+            or len(point) != 2
+            or not all(isinstance(coordinate, (int, float)) for coordinate in point)
+        ):
+            return None
+        points.append((round(point[0]), round(point[1])))
+    return tuple(points)
+
+
+def _metadata_tone(value: object) -> int | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return max(0, min(255, round(value)))
 
 
 def _segmentation_union_bbox(
@@ -526,7 +702,9 @@ def _segmentation_union_bbox(
     return x1, y1, x2 - x1, y2 - y1
 
 
-def _ensure_render_bboxes(regions: Sequence[TextRegion], image_size: tuple[int, int]) -> None:
+def _ensure_render_bboxes(
+    regions: Sequence[TextRegion], image_size: tuple[int, int]
+) -> None:
     image_width, image_height = image_size
     for region in regions:
         if region.render_bbox is None:
@@ -539,7 +717,9 @@ def _ensure_render_bboxes(regions: Sequence[TextRegion], image_size: tuple[int, 
         region.render_bbox = (x, y, width, height)
 
 
-def _render_text(image: Image.Image, regions: list[TextRegion], font_path: str | None) -> Image.Image:
+def _render_text(
+    image: Image.Image, regions: list[TextRegion], font_path: str | None
+) -> Image.Image:
     output = image.convert("RGB")
     draw = ImageDraw.Draw(output)
     _ensure_render_bboxes(regions, output.size)
@@ -548,48 +728,25 @@ def _render_text(image: Image.Image, regions: list[TextRegion], font_path: str |
         if width <= 4 or height <= 4 or not region.translated_text:
             continue
 
-        padding = max(8, min(width, height) // 16)
-        max_width = max(4, width - padding * 2)
-        max_height = max(4, height - padding * 2)
-
-        # Target about 65 % of the available space so text has breathing room.
-        fill_ratio = 0.65
-        target_width = max(4, int(max_width * fill_ratio))
-        target_height = max(4, int(max_height * fill_ratio))
-
-        minimum_size = 8
-        maximum_size = max(minimum_size, min(64, min(target_width, target_height) // 3))
-
-        def layout(size: int) -> tuple[ImageFont.ImageFont, str, tuple[int, int, int, int]]:
-            font = _load_font(size, font_path)
-            candidate = _wrap_text(draw, region.translated_text, font, target_width)
-            spacing = max(2, size // 5)
-            bounds = draw.multiline_textbbox((0, 0), candidate, font=font, spacing=spacing)
-            return font, candidate, bounds
-
-        requested_size = (
-            maximum_size
-            if region.font_size is None
-            else max(minimum_size, min(maximum_size, region.font_size))
+        has_safe_bounds = (
+            _metadata_bbox(region.detector_metadata.get("bubble_text_bbox")) is not None
+            and region.detector_metadata.get("manual_render_bbox") is not True
         )
-        low, high = minimum_size, requested_size
-        selected_font, selected_text, text_bounds = layout(minimum_size)
-        while low <= high:
-            size = (low + high) // 2
-            candidate_font, candidate_text, candidate_bounds = layout(size)
-            fits = (
-                candidate_bounds[2] - candidate_bounds[0] <= target_width
-                and candidate_bounds[3] - candidate_bounds[1] <= target_height
-            )
-            if fits:
-                selected_font, selected_text, text_bounds = (
-                    candidate_font,
-                    candidate_text,
-                    candidate_bounds,
-                )
-                low = size + 1
-            else:
-                high = size - 1
+        padding_ratio = 0.025 if has_safe_bounds else 0.10
+        padding = max(2, round(min(width, height) * padding_ratio))
+        target_width = max(4, width - padding * 2)
+        target_height = max(4, height - padding * 2)
+        layout = _fit_text_layout(
+            draw,
+            region.translated_text,
+            font_path,
+            target_width,
+            target_height,
+            region.font_size,
+        )
+        if layout is None:
+            continue
+        selected_font, selected_text, text_bounds, spacing = layout
 
         text_width = text_bounds[2] - text_bounds[0]
         text_height = text_bounds[3] - text_bounds[1]
@@ -603,7 +760,7 @@ def _render_text(image: Image.Image, regions: list[TextRegion], font_path: str |
             font=selected_font,
             fill="black",
             align="center",
-            spacing=max(2, selected_font.size // 5) if hasattr(selected_font, "size") else 3,
+            spacing=spacing,
             stroke_width=1,
             stroke_fill="white",
         )
@@ -621,120 +778,6 @@ def render_page(
         rendered.save(output_path, format="PNG")
 
 
-def _polygon_geometry_mask(
-    image_shape: tuple[int, ...], polygons: Sequence[Sequence[Point]]
-) -> np.ndarray:
-    """Rasterize detector geometry without expanding it to a bounding box."""
-    mask = np.zeros(image_shape[:2], dtype=np.uint8)
-    for points in polygons:
-        polygon = np.array([[point.x, point.y] for point in points], dtype=np.int32)
-        if len(polygon) >= 3:
-            cv2.fillPoly(mask, [polygon], 255)
-    return mask
-
-
-def _region_geometry_mask(
-    image_shape: tuple[int, ...], region: TextRegion
-) -> np.ndarray:
-    """Rasterize all detector text geometry for one accepted region."""
-    return _polygon_geometry_mask(
-        image_shape, region.segmentation or [region.polygon]
-    )
-
-
-def _find_white_bubble_component(
-    image: np.ndarray,
-    geometry: np.ndarray,
-    light_mask: np.ndarray,
-    light_labels: np.ndarray,
-    light_stats: np.ndarray,
-) -> np.ndarray | None:
-    """Find a local, enclosed light component around an OCR region.
-
-    A connected component is used instead of a rectangle so irregular bubbles
-    and their tails do not turn into large rectangular cleanup areas.
-    """
-    geometry_area = cv2.countNonZero(geometry)
-    if geometry_area == 0:
-        return None
-
-    x, y, width, height = cv2.boundingRect(geometry)
-    context_radius = max(6, min(24, int(round(min(width, height) * 0.25))))
-    context_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (context_radius * 2 + 1, context_radius * 2 + 1),
-    )
-    context = cv2.dilate(geometry, context_kernel)
-
-    light_inside = cv2.bitwise_and(light_mask, geometry)
-    light_inside_ratio = cv2.countNonZero(light_inside) / geometry_area
-    ring = context.copy()
-    ring[geometry > 0] = 0
-    ring_area = cv2.countNonZero(ring)
-    if light_inside_ratio < 0.35 or ring_area == 0:
-        return None
-    light_ring = cv2.bitwise_and(light_mask, ring)
-    if cv2.countNonZero(light_ring) / ring_area < 0.50:
-        return None
-
-    # Prefer the light component actually under the detector polygon. On a
-    # white page, using the whole context first selects the page background
-    # instead of a closed bubble because it overlaps more of the ring.
-    candidate_labels = light_labels[geometry > 0]
-    candidate_labels = candidate_labels[candidate_labels > 0]
-    if candidate_labels.size == 0:
-        candidate_labels = light_labels[context > 0]
-        candidate_labels = candidate_labels[candidate_labels > 0]
-    if candidate_labels.size == 0:
-        return None
-    labels, counts = np.unique(candidate_labels, return_counts=True)
-    label = int(labels[int(np.argmax(counts))])
-
-    image_height, image_width = image.shape[:2]
-    component_x, component_y, component_width, component_height, component_area = (
-        int(value) for value in light_stats[label]
-    )
-    if (
-        component_x <= 1
-        or component_y <= 1
-        or component_x + component_width >= image_width - 1
-        or component_y + component_height >= image_height - 1
-    ):
-        # A page or panel background usually reaches an image edge. Requiring
-        # an enclosed component avoids treating titles and sound effects on
-        # the page background as speech text.
-        return None
-    if component_width * component_height > image_width * image_height * 0.45:
-        return None
-    if component_area < max(256, int(geometry_area * 0.35)):
-        return None
-
-    geometry_center_x = x + width / 2
-    geometry_center_y = y + height / 2
-    if not (
-        component_x - context_radius
-        <= geometry_center_x
-        <= component_x + component_width + context_radius
-        and component_y - context_radius
-        <= geometry_center_y
-        <= component_y + component_height + context_radius
-    ):
-        return None
-
-    component = np.where(light_labels == label, 255, 0).astype(np.uint8)
-    # The separated component is eroded to break scan gaps, so inspect a few
-    # pixels farther out when looking for the bubble's dark outline.
-    boundary_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    boundary = cv2.subtract(cv2.dilate(component, boundary_kernel), component)
-    dark_boundary = cv2.bitwise_and(
-        boundary, cv2.inRange(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 0, 160)
-    )
-    boundary_area = cv2.countNonZero(boundary)
-    if boundary_area == 0 or cv2.countNonZero(dark_boundary) / boundary_area < 0.03:
-        return None
-    return component
-
-
 def _build_inpainting_mask(
     image: np.ndarray, regions: Sequence[TextRegion], dilation: int
 ) -> np.ndarray:
@@ -744,60 +787,63 @@ def _build_inpainting_mask(
         return mask
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # A light component is deliberately stricter than a generic grayscale
-    # threshold: screen tones and artwork should not qualify as a bubble.
-    light_mask = cv2.inRange(gray, 225, 255)
-    _, light_labels, light_stats, _ = cv2.connectedComponentsWithStats(
-        light_mask, connectivity=8
-    )
-    # Small gaps in scanned bubble outlines can connect their white interior
-    # to the page background. A lightly eroded copy separates those bridges
-    # without changing the source pixels used for inpainting.
-    separated_light_mask = cv2.erode(
-        light_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    )
-    _, separated_labels, separated_stats, _ = cv2.connectedComponentsWithStats(
-        separated_light_mask, connectivity=8
-    )
-    dark_mask = cv2.inRange(gray, 0, 210)
+    dark_masks: dict[int, np.ndarray] = {}
+    locator: WhiteBubbleLocator | None = None
 
     for region in regions:
-        # A recognizer can group lines from adjacent bubbles into one region.
-        # Evaluate each detector polygon separately so each line can select its
-        # own enclosing light component.
+        contour = _metadata_contour(region.detector_metadata.get("bubble_contour"))
+        region_tone = _metadata_tone(region.detector_metadata.get("bubble_fill_tone"))
+        if contour is None and region.detector_metadata.get("bubble_checked") is True:
+            continue
+
+        contour_support: np.ndarray | None = None
+        if contour is not None:
+            contour_support = np.zeros(image.shape[:2], dtype=np.uint8)
+            cv2.fillPoly(
+                contour_support,
+                [np.array(contour, dtype=np.int32)],
+                255,
+            )
+
+        bubble_supports: dict[tuple[int, int], np.ndarray] = {}
         for points in region.segmentation or [region.polygon]:
             geometry = _polygon_geometry_mask(image.shape, [points])
-            bubble = _find_white_bubble_component(
-                image, geometry, light_mask, light_labels, light_stats
-            )
-            if bubble is None:
-                bubble = _find_white_bubble_component(
-                    image,
-                    geometry,
-                    separated_light_mask,
-                    separated_labels,
-                    separated_stats,
+            bubble_support = contour_support
+            fill_tone = region_tone or 255
+            if bubble_support is not None:
+                geometry_area = cv2.countNonZero(geometry)
+                supported_area = cv2.countNonZero(
+                    cv2.bitwise_and(geometry, bubble_support)
                 )
-            if bubble is None:
-                continue
-
-            # Detector polygons can cover whitespace around a line. Recover
-            # the actual dark glyph pixels before applying the safety margin.
-            bubble_support = np.zeros_like(bubble)
-            contours, _ = cv2.findContours(
-                bubble, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if contours:
-                cv2.drawContours(bubble_support, contours, -1, 255, cv2.FILLED)
-            bubble_support = cv2.dilate(
-                bubble_support,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-            )
+                if not geometry_area or supported_area / geometry_area < 0.80:
+                    bubble_support = None
+            if bubble_support is None:
+                locator = locator or WhiteBubbleLocator(image)
+                bubble_match = locator.find(geometry)
+                if bubble_match is None:
+                    continue
+                fill_tone = bubble_match.fill_tone
+                bubble_key = (bubble_match.component_set, bubble_match.label)
+                bubble_support = bubble_supports.get(bubble_key)
+                if bubble_support is None:
+                    bubble = locator.mask(bubble_match)
+                    contours, _ = cv2.findContours(
+                        bubble, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    bubble_support = np.zeros_like(bubble)
+                    if contours:
+                        cv2.drawContours(bubble_support, contours, -1, 255, cv2.FILLED)
+                    bubble_supports[bubble_key] = bubble_support
+            text_threshold = max(0, min(210, fill_tone - 30))
+            dark_mask = dark_masks.get(text_threshold)
+            if dark_mask is None:
+                dark_mask = cv2.inRange(gray, 0, text_threshold)
+                dark_masks[text_threshold] = dark_mask
             text_mask = cv2.bitwise_and(dark_mask, geometry)
             text_mask = cv2.bitwise_and(text_mask, bubble_support)
 
-            component_count, text_labels, text_stats, _ = cv2.connectedComponentsWithStats(
-                text_mask, connectivity=8
+            component_count, text_labels, text_stats, _ = (
+                cv2.connectedComponentsWithStats(text_mask, connectivity=8)
             )
             filtered = np.zeros_like(text_mask)
             for label in range(1, component_count):
@@ -841,23 +887,20 @@ def clean_image(
 ) -> np.ndarray:
     """Apply automatic and explicit cleanup masks to a decoded BGR image."""
     automatic_mask = _build_inpainting_mask(image, regions, dilation)
-    mask = automatic_mask.copy()
     manual_mask = np.zeros_like(automatic_mask)
     _add_manual_inpaint_regions(manual_mask, manual_inpaint_regions)
-    mask = cv2.bitwise_or(mask, manual_mask)
-    if not cv2.countNonZero(mask):
+    has_automatic_mask = bool(cv2.countNonZero(automatic_mask))
+    has_manual_mask = bool(cv2.countNonZero(manual_mask))
+    if not has_automatic_mask and not has_manual_mask:
         return image
 
-    cleaned = cv2.inpaint(image, mask, 3, cv2.INPAINT_NS)
-    if cv2.countNonZero(manual_mask):
-        # User rectangles usually cover a small glyph; a tight radius avoids
-        # pulling in nearby outlines or artwork when the selection is narrow.
+    cleaned = (
+        cv2.inpaint(image, automatic_mask, 3, cv2.INPAINT_NS)
+        if has_automatic_mask
+        else image.copy()
+    )
+    if has_manual_mask:
         cleaned = cv2.inpaint(cleaned, manual_mask, 1, cv2.INPAINT_NS)
-    if cv2.countNonZero(automatic_mask):
-        # Automatic mask pixels are restricted to white bubbles. Manual
-        # rectangles are intentionally left to inpainting because they may
-        # cover artwork or a non-white background.
-        cleaned[automatic_mask > 0] = (255, 255, 255)
     return cleaned
 
 
@@ -872,7 +915,8 @@ def clean_page(
     if image is None:
         raise PipelineError(f"Could not decode image: {source_path.name}")
     cleaned = clean_image(image, regions, dilation, manual_inpaint_regions)
-    cv2.imwrite(str(cleaned_path), cleaned)
+    if not cv2.imwrite(str(cleaned_path), cleaned):
+        raise PipelineError(f"Could not write cleaned image: {cleaned_path.name}")
 
 
 def process_page(
@@ -887,9 +931,15 @@ def process_page(
     if detector is None and recognizer is None:
         # These models do not depend on one another; load them together so the
         # first page does not pay both model initialization costs sequentially.
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="aria-provider-init") as executor:
-            detector_future = executor.submit(create_detector, options.detector_provider)
-            recognizer_future = executor.submit(create_recognizer, options.recognizer_provider)
+        with ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="aria-provider-init"
+        ) as executor:
+            detector_future = executor.submit(
+                create_detector, options.detector_provider
+            )
+            recognizer_future = executor.submit(
+                create_recognizer, options.recognizer_provider
+            )
             detector = detector_future.result()
             recognizer = recognizer_future.result()
     else:
@@ -907,7 +957,9 @@ def process_page(
         warnings.append("No text regions were detected.")
 
     if options.translation_provider == "deepl" and not os.getenv("DEEPL_API_KEY"):
-        warnings.append("DEEPL_API_KEY is not configured; source text was used as the translation.")
+        warnings.append(
+            "DEEPL_API_KEY is not configured; source text was used as the translation."
+        )
 
     translated = _translate_regions(regions, options)
     for region, translation in zip(regions, translated):
@@ -922,7 +974,8 @@ def process_page(
     # Only accepted OCR regions are eligible for automatic cleanup. Explicit
     # manual regions are empty during initial processing.
     cleaned = clean_image(image, regions, options.mask_dilation)
-    cv2.imwrite(str(cleaned_path), cleaned)
+    if not cv2.imwrite(str(cleaned_path), cleaned):
+        raise PipelineError(f"Could not write cleaned image: {cleaned_path.name}")
 
     cleaned_pil = Image.fromarray(cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB))
     rendered = _render_text(cleaned_pil, regions, options.font_path)

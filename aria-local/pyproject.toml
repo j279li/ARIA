@@ -33,6 +33,8 @@ argos = [
 ]
 helsinki = [
     "sentencepiece>=0.2,<1",
+    "torch>=2.2,<3",
+    "transformers>=4.48,<5",
 ]
 providers = [
     "manga-ocr>=0.1.11,<1",

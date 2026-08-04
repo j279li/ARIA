@@ -15,9 +15,9 @@ translation, text cleanup, and server-side rendering of translated pages.
    speech bubbles, then removes those glyphs with OpenCV inpainting.
 7. ARIA renders the translated text and exposes the original, cleaned, and final images.
 
-Completed pages can be edited in the frontend and rerendered without repeating
-OCR or translation. The renderer automatically expands narrow OCR boxes into a
-larger bubble-oriented layout area and fits English text to that area.
+Completed pages can be manually cleaned and rerendered without repeating OCR or
+translation. The renderer removes narrow tails and curved edges from the usable
+layout area, then chooses the largest wrapped font whose measured pixels fit.
 
 The local backend deliberately stores each intermediate artifact so later work
 can add OCR correction, translation editing, better masks, and rerendering
@@ -26,8 +26,9 @@ without repeating every stage.
 Cleanup is intentionally conservative. Detector regions rejected by OCR are not
 cleaned, and a region must have a light, locally enclosed bubble-like background
 before its dark pixels are masked. This avoids treating sound effects, titles,
-and artwork as dialogue. `ARIA_MASK_DILATION` expands the refined glyph mask;
-it no longer expands the entire detector polygon.
+and artwork as dialogue. A strict OCR-seeded fallback handles enclosed cream and
+gray bubbles while preserving their original tone. `ARIA_MASK_DILATION` expands
+the refined glyph mask; it no longer expands the entire detector polygon.
 
 Bubbles that intentionally open into a panel frame are left alone when their
 light interior is indistinguishable from the page background. Automatically
@@ -85,9 +86,9 @@ It is expected to be less natural than DeepL for manga dialogue, and its model
 package is downloaded the first time it is selected.
 
 **Helsinki OPUS-MT** (`Helsinki-NLP/opus-mt-ja-en`) is also available as a local
-option. It produces higher-quality translations than Argos and is preferred by
-the frontend when `transformers` and `sentencepiece` are installed in the backend
-environment.
+option and usually produces higher-quality translations than Argos. When a
+DeepL key is configured, the frontend prefers DeepL for translation quality;
+Helsinki remains the preferred local option.
 
 To use DeepL:
 

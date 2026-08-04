@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import json
 import importlib.util
 import logging
 import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +36,7 @@ class JobManager:
         self.root.mkdir(parents=True, exist_ok=True)
         self.jobs: dict[str, JobStatus] = {}
         self.lock = threading.RLock()
+        self.page_locks: dict[tuple[str, str], threading.Lock] = {}
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aria-job")
 
     def _job_dir(self, job_id: str) -> Path:
@@ -45,6 +44,11 @@ class JobManager:
 
     def _status_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "job.json"
+
+    def _page_lock(self, job_id: str, page_id: str) -> threading.Lock:
+        key = (job_id, page_id)
+        with self.lock:
+            return self.page_locks.setdefault(key, threading.Lock())
 
     def _persist(self, job: JobStatus) -> None:
         path = self._status_path(job.id)
@@ -148,10 +152,8 @@ class JobManager:
             font_path=os.getenv("ARIA_FONT_PATH") or None,
             mask_dilation=int(os.getenv("ARIA_MASK_DILATION", "5")),
         )
-        regions, warnings = process_page(source_path, cleaned_path, output_path, options)
-        (page_dir / "regions.json").write_text(
-            json.dumps([region.model_dump() for region in regions], ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        regions, warnings = process_page(
+            source_path, cleaned_path, output_path, options
         )
         with self.lock:
             page.status = "complete"
@@ -164,22 +166,33 @@ class JobManager:
     def rerender_page(
         self, job_id: str, page_id: str, request: PageRenderRequest
     ) -> JobStatus:
+        with self._page_lock(job_id, page_id):
+            return self._rerender_page(job_id, page_id, request)
+
+    def _rerender_page(
+        self, job_id: str, page_id: str, request: PageRenderRequest
+    ) -> JobStatus:
         job = self.get(job_id)
         if job is None:
             raise LookupError("Job not found")
-        page = next((candidate for candidate in job.pages if candidate.id == page_id), None)
+        page = next(
+            (candidate for candidate in job.pages if candidate.id == page_id), None
+        )
         if page is None:
             raise LookupError("Page not found")
         if page.status != "complete":
             raise ValueError("Only completed pages can be rerendered")
 
-        page_dir = self._job_dir(job.id) / page.id
+        updated_page = page.model_copy(deep=True)
+        page_dir = self._job_dir(job.id) / updated_page.id
         cleaned_path = page_dir / "cleaned.png"
         output_path = page_dir / "translated.png"
+        next_cleaned_path = page_dir / "cleaned.next.png"
+        next_output_path = page_dir / "translated.next.png"
         if not cleaned_path.exists():
             raise ValueError("Cleaned image is missing")
 
-        regions = {region.id: region for region in page.regions}
+        regions = {region.id: region for region in updated_page.regions}
         for update in request.regions:
             region = regions.get(update.id)
             if region is None:
@@ -188,41 +201,58 @@ class JobManager:
                 region.translated_text = update.translated_text or ""
             if "render_bbox" in update.model_fields_set:
                 region.render_bbox = update.render_bbox
+                region.detector_metadata["manual_render_bbox"] = (
+                    update.render_bbox is not None
+                )
             if "font_size" in update.model_fields_set:
                 region.font_size = update.font_size
 
+        manual_regions_changed = (
+            request.manual_inpaint_regions is not None
+            and request.manual_inpaint_regions != page.manual_inpaint_regions
+        )
         if request.manual_inpaint_regions is not None:
-            page.manual_inpaint_regions = request.manual_inpaint_regions
+            updated_page.manual_inpaint_regions = request.manual_inpaint_regions
 
-        source_candidates = list(page_dir.glob("original.*"))
-        if not source_candidates:
-            raise ValueError("Original image is missing")
-        clean_page(
-            source_candidates[0],
-            cleaned_path,
-            page.regions,
-            int(os.getenv("ARIA_MASK_DILATION", "5")),
-            page.manual_inpaint_regions,
-        )
-        render_page(cleaned_path, output_path, page.regions, os.getenv("ARIA_FONT_PATH") or None)
-        (page_dir / "regions.json").write_text(
-            json.dumps(
-                [region.model_dump() for region in page.regions],
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        try:
+            render_source = cleaned_path
+            if manual_regions_changed:
+                source_candidates = list(page_dir.glob("original.*"))
+                if not source_candidates:
+                    raise ValueError("Original image is missing")
+                clean_page(
+                    source_candidates[0],
+                    next_cleaned_path,
+                    updated_page.regions,
+                    int(os.getenv("ARIA_MASK_DILATION", "5")),
+                    updated_page.manual_inpaint_regions,
+                )
+                render_source = next_cleaned_path
+            render_page(
+                render_source,
+                next_output_path,
+                updated_page.regions,
+                os.getenv("ARIA_FONT_PATH") or None,
+            )
+            if manual_regions_changed:
+                next_cleaned_path.replace(cleaned_path)
+            next_output_path.replace(output_path)
+        finally:
+            next_cleaned_path.unlink(missing_ok=True)
+            next_output_path.unlink(missing_ok=True)
+
         cache_version = uuid.uuid4().hex[:8]
-        page.cleaned_url = (
-            f"/api/jobs/{job.id}/pages/{page.id}/artifacts/cleaned"
-            f"?v={cache_version}"
-        )
-        page.output_url = (
-            f"/api/jobs/{job.id}/pages/{page.id}/artifacts/translated"
-            f"?v={cache_version}"
+        if manual_regions_changed:
+            updated_page.cleaned_url = (
+                f"/api/jobs/{job.id}/pages/{page.id}/artifacts/cleaned"
+                f"?v={cache_version}"
+            )
+        updated_page.output_url = (
+            f"/api/jobs/{job.id}/pages/{page.id}/artifacts/translated?v={cache_version}"
         )
         with self.lock:
+            page_index = job.pages.index(page)
+            job.pages[page_index] = updated_page
             self._persist(job)
         return job
 
@@ -230,41 +260,7 @@ class JobManager:
 manager = JobManager(DATA_ROOT)
 
 
-def _warm_providers() -> None:
-    if os.getenv("ARIA_WARM_PROVIDERS", "1").lower() not in {"1", "true", "yes"}:
-        return
-
-    from .pipeline import create_detector, create_recognizer, create_translation_provider
-
-    def _warm() -> None:
-        tasks = []
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="aria-warm") as executor:
-            if importlib.util.find_spec("paddleocr") and importlib.util.find_spec("paddle"):
-                tasks.append(executor.submit(create_detector, "paddleocr"))
-            if importlib.util.find_spec("manga_ocr"):
-                tasks.append(executor.submit(create_recognizer, "manga-ocr"))
-            if importlib.util.find_spec("transformers") and importlib.util.find_spec(
-                "sentencepiece"
-            ):
-                tasks.append(executor.submit(create_translation_provider, "helsinki"))
-            elif importlib.util.find_spec("argostranslate"):
-                tasks.append(executor.submit(create_translation_provider, "argos"))
-            for future in tasks:
-                try:
-                    future.result()
-                except Exception:
-                    logger.debug("Provider warm-up skipped", exc_info=True)
-
-    threading.Thread(target=_warm, name="aria-warm", daemon=True).start()
-
-
-@asynccontextmanager
-async def _lifespan(_app: FastAPI):  # type: ignore[misc]
-    _warm_providers()
-    yield
-
-
-app = FastAPI(title="ARIA Local", version="0.1.0", lifespan=_lifespan)
+app = FastAPI(title="ARIA Local", version="0.1.0")
 
 
 allowed_origins = [
@@ -293,7 +289,11 @@ def providers() -> dict[str, list[dict[str, object]]]:
     tesseract_path = resolve_tesseract_command()
     return {
         "detectors": [
-            {"id": "tesseract", "label": "Tesseract", "available": bool(tesseract_path)},
+            {
+                "id": "tesseract",
+                "label": "Tesseract",
+                "available": bool(tesseract_path),
+            },
             {
                 "id": "paddleocr",
                 "label": "PaddleOCR",
@@ -302,7 +302,11 @@ def providers() -> dict[str, list[dict[str, object]]]:
             },
         ],
         "recognizers": [
-            {"id": "tesseract", "label": "Tesseract", "available": bool(tesseract_path)},
+            {
+                "id": "tesseract",
+                "label": "Tesseract",
+                "available": bool(tesseract_path),
+            },
             {
                 "id": "manga-ocr",
                 "label": "Manga OCR",
@@ -333,21 +337,48 @@ def providers() -> dict[str, list[dict[str, object]]]:
 
 @app.post("/api/jobs", response_model=JobStatus, status_code=202)
 async def create_job(
-    files: list[UploadFile] = File(...),
-    detector_provider: Literal["tesseract", "paddleocr"] | None = Form(None),
-    recognizer_provider: Literal["tesseract", "manga-ocr"] | None = Form(None),
-    translation_provider: Literal["deepl", "argos", "helsinki", "identity"] | None = Form(None),
+    files: Annotated[list[UploadFile], File()],
+    detector_provider: Annotated[
+        Literal["tesseract", "paddleocr"] | None, Form()
+    ] = None,
+    recognizer_provider: Annotated[
+        Literal["tesseract", "manga-ocr"] | None, Form()
+    ] = None,
+    translation_provider: Annotated[
+        Literal["deepl", "argos", "helsinki", "identity"] | None, Form()
+    ] = None,
 ) -> JobStatus:
     if not files or len(files) > MAX_FILES:
-        raise HTTPException(status_code=400, detail=f"Upload between 1 and {MAX_FILES} images.")
+        raise HTTPException(
+            status_code=400, detail=f"Upload between 1 and {MAX_FILES} images."
+        )
+
+    selected_detector = detector_provider or os.getenv(
+        "ARIA_TEXT_DETECTOR", "tesseract"
+    )
+    selected_recognizer = recognizer_provider or os.getenv(
+        "ARIA_TEXT_RECOGNIZER", "tesseract"
+    )
+    selected_translator = translation_provider or os.getenv(
+        "ARIA_TRANSLATION_PROVIDER", "deepl"
+    )
+    if selected_detector == "paddleocr" and selected_recognizer != "manga-ocr":
+        raise HTTPException(
+            status_code=400,
+            detail="PaddleOCR must be paired with Manga OCR.",
+        )
 
     uploads: list[tuple[str, bytes]] = []
     for upload in files:
         if upload.content_type and not upload.content_type.startswith("image/"):
-            raise HTTPException(status_code=415, detail=f"Unsupported file type: {upload.content_type}")
+            raise HTTPException(
+                status_code=415, detail=f"Unsupported file type: {upload.content_type}"
+            )
         contents = await upload.read(MAX_FILE_BYTES + 1)
         if not contents:
-            raise HTTPException(status_code=400, detail="Uploaded images cannot be empty.")
+            raise HTTPException(
+                status_code=400, detail="Uploaded images cannot be empty."
+            )
         if len(contents) > MAX_FILE_BYTES:
             raise HTTPException(
                 status_code=413,
@@ -357,12 +388,9 @@ async def create_job(
 
     return manager.create_job(
         uploads,
-        detector_provider=detector_provider
-        or os.getenv("ARIA_TEXT_DETECTOR", "tesseract"),
-        recognizer_provider=recognizer_provider
-        or os.getenv("ARIA_TEXT_RECOGNIZER", "tesseract"),
-        translation_provider=translation_provider
-        or os.getenv("ARIA_TRANSLATION_PROVIDER", "deepl"),
+        detector_provider=selected_detector,
+        recognizer_provider=selected_recognizer,
+        translation_provider=selected_translator,
     )
 
 

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import os
 import unicodedata
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from threading import Lock
-from dataclasses import dataclass, field
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 import cv2
 import numpy as np
 
+from .bubbles import BubbleMatch, WhiteBubbleLocator, polygon_geometry_mask
 from .models import PipelineOptions, Point
 
 
@@ -47,47 +49,9 @@ class TextRecognizer(Protocol):
         """Return one OCR result for each detected region, in the same order."""
 
 
-class MaskProvider(Protocol):
-    def create_mask(
-        self,
-        image_shape: tuple[int, ...],
-        regions: Sequence[DetectedRegion],
-        dilation: int,
-    ) -> np.ndarray:
-        """Create an 8-bit inpainting mask for the detected regions."""
-
-
 class TranslationProvider(Protocol):
-    def translate(
-        self, texts: Sequence[str], options: PipelineOptions
-    ) -> list[str]:
+    def translate(self, texts: Sequence[str], options: PipelineOptions) -> list[str]:
         """Translate source texts in order."""
-
-
-class PolygonMaskProvider:
-    """Rasterize detector polygons and optionally expand them for inpainting."""
-
-    def create_mask(
-        self,
-        image_shape: tuple[int, ...],
-        regions: Sequence[DetectedRegion],
-        dilation: int,
-    ) -> np.ndarray:
-        mask = np.zeros(image_shape[:2], dtype=np.uint8)
-        for region in regions:
-            polygons = region.segmentation or [region.polygon]
-            for points in polygons:
-                polygon = np.array(
-                    [[point.x, point.y] for point in points], dtype=np.int32
-                )
-                if len(polygon) >= 3:
-                    cv2.fillPoly(mask, [polygon], 255)
-
-        if dilation:
-            kernel_size = dilation * 2 + 1
-            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-            mask = cv2.dilate(mask, kernel)
-        return mask
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -102,8 +66,7 @@ class ArgosTranslationProvider:
 
     def __init__(self) -> None:
         try:
-            import argostranslate.package as package
-            import argostranslate.translate as translate
+            from argostranslate import package, translate
         except ImportError as exc:
             raise ProviderUnavailableError(
                 "The Argos Translate provider is not installed. "
@@ -150,9 +113,7 @@ class ArgosTranslationProvider:
                 "Argos Japanese-to-English model installation did not complete."
             )
 
-    def translate(
-        self, texts: Sequence[str], options: PipelineOptions
-    ) -> list[str]:
+    def translate(self, texts: Sequence[str], options: PipelineOptions) -> list[str]:
         del options
         translated: dict[str, str] = {}
         for text in texts:
@@ -161,11 +122,15 @@ class ArgosTranslationProvider:
                 if not result:
                     normalized = unicodedata.normalize("NFKC", text)
                     if normalized != text:
-                        result = self._translate.translate(normalized, "ja", "en").strip()
+                        result = self._translate.translate(
+                            normalized, "ja", "en"
+                        ).strip()
                     if not result:
                         simplified = normalized.rstrip(" .!?。！？…")
                         if simplified != normalized:
-                            result = self._translate.translate(simplified, "ja", "en").strip()
+                            result = self._translate.translate(
+                                simplified, "ja", "en"
+                            ).strip()
                 translated[text] = result or text
         return [translated[text] for text in texts]
 
@@ -190,7 +155,7 @@ _HELSINKI_MODEL_NAME = "Helsinki-NLP/opus-mt-ja-en"
 
 def _load_helsinki_model() -> tuple[Any, Any]:
     try:
-        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     except ImportError as exc:
         raise ProviderUnavailableError(
             "The Helsinki OPUS-MT provider requires the transformers package. "
@@ -219,15 +184,13 @@ def _get_helsinki_model() -> tuple[Any, Any]:
 class HelsinkiTranslationProvider:
     """Translate Japanese to English with Helsinki OPUS-MT."""
 
-    def translate(
-        self, texts: Sequence[str], options: PipelineOptions
-    ) -> list[str]:
+    def translate(self, texts: Sequence[str], options: PipelineOptions) -> list[str]:
         del options
         if not texts:
             return []
         model, tokenizer = _get_helsinki_model()
+        pending = list(dict.fromkeys(texts))
         deduped: dict[str, str] = {}
-        pending = [text for text in texts if text not in deduped]
         if pending:
             inputs = tokenizer(pending, return_tensors="pt", padding=True)
             outputs = model.generate(**inputs, max_new_tokens=80)
@@ -316,7 +279,6 @@ class PaddleOCRDetector:
                     ),
                 )
                 self._modern_api = True
-                self._detection_only = True
                 return
             except (TypeError, ValueError, RuntimeError):
                 # Fall back to PaddleOCR's public pipeline for older/partial installs.
@@ -332,7 +294,6 @@ class PaddleOCRDetector:
                 enable_mkldnn=enable_mkldnn,
             )
             self._modern_api = True
-            self._detection_only = False
         except TypeError:
             self._ocr = PaddleOCR(
                 lang=language,
@@ -341,18 +302,22 @@ class PaddleOCRDetector:
                 enable_mkldnn=enable_mkldnn,
             )
             self._modern_api = False
-            self._detection_only = False
 
     def detect(self, image_path: str, options: PipelineOptions) -> list[DetectedRegion]:
+        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
         if self._modern_api:
             results = self._ocr.predict(image_path)
-            return self._regions_from_modern_results(results, options)
+            return self._regions_from_modern_results(results, options, image=image)
 
         results = self._ocr.ocr(image_path, cls=True)
-        return self._regions_from_legacy_results(results, options)
+        return self._regions_from_legacy_results(results, options, image=image)
 
     def _regions_from_modern_results(
-        self, results: Any, options: PipelineOptions
+        self,
+        results: Any,
+        options: PipelineOptions,
+        *,
+        image: np.ndarray | None = None,
     ) -> list[DetectedRegion]:
         regions: list[DetectedRegion] = []
         for result in results or []:
@@ -374,10 +339,12 @@ class PaddleOCRDetector:
                 detector_score = _float_or_none(
                     detector_scores[index] if index < len(detector_scores) else None
                 )
-                score = recognition_score if recognition_score is not None else detector_score
-                if (
-                    score is not None and score * 100 < options.min_confidence
-                ):
+                score = (
+                    recognition_score
+                    if recognition_score is not None
+                    else detector_score
+                )
+                if score is not None and score * 100 < options.min_confidence:
                     continue
                 text = str(texts[index]).strip() if index < len(texts) else None
                 regions.append(
@@ -389,10 +356,14 @@ class PaddleOCRDetector:
                         metadata={"provider": "paddleocr", "api": "modern"},
                     )
                 )
-        return group_detected_regions(regions)
+        return group_detected_regions(regions, image=image)
 
     def _regions_from_legacy_results(
-        self, results: Any, options: PipelineOptions
+        self,
+        results: Any,
+        options: PipelineOptions,
+        *,
+        image: np.ndarray | None = None,
     ) -> list[DetectedRegion]:
         regions: list[DetectedRegion] = []
         for page in results or []:
@@ -418,44 +389,171 @@ class PaddleOCRDetector:
                         metadata={"provider": "paddleocr", "api": "legacy"},
                     )
                 )
-        return group_detected_regions(regions)
+        return group_detected_regions(regions, image=image)
 
 
-def group_detected_regions(regions: Sequence[DetectedRegion]) -> list[DetectedRegion]:
+def group_detected_regions(
+    regions: Sequence[DetectedRegion], *, image: np.ndarray | None = None
+) -> list[DetectedRegion]:
     """Combine nearby OCR lines so recognizers receive one speech bubble at a time."""
     candidates = [region for region in regions if _keep_detected_region(region)]
-    if len(candidates) < 2:
-        return list(candidates)
+    if not candidates:
+        return []
+    if len(candidates) == 1:
+        return _annotate_single_regions(candidates, image)
+
+    locator = WhiteBubbleLocator(image) if image is not None else None
+    bubble_matches: dict[int, BubbleMatch | None] = {}
+    if locator is not None:
+        for region in candidates:
+            geometry = polygon_geometry_mask(
+                image.shape, region.segmentation or [region.polygon]
+            )
+            bubble_matches[id(region)] = locator.find(geometry)
+        _assign_unmatched_regions_to_bubbles(
+            candidates, bubble_matches, locator, image.shape
+        )
 
     groups: list[list[DetectedRegion]] = []
-    for region in candidates:
-        matching_groups = [
-            group
-            for group in groups
-            if any(_regions_should_merge(region, member) for member in group)
-        ]
-        if not matching_groups:
+    ordered_candidates = sorted(
+        candidates,
+        key=lambda region: (
+            region.bbox[1],
+            region.bbox[0],
+            region.bbox[3],
+            region.bbox[2],
+            region.orientation,
+            region.source_text or "",
+        ),
+    )
+    for region in ordered_candidates:
+        matching_group = next(
+            (
+                group
+                for group in groups
+                if all(
+                    _regions_should_merge(
+                        region,
+                        member,
+                        bubble_matches.get(id(region)),
+                        bubble_matches.get(id(member)),
+                    )
+                    for member in group
+                )
+            ),
+            None,
+        )
+        if matching_group is None:
             groups.append([region])
-            continue
-
-        target = matching_groups[0]
-        target.append(region)
-        for other in matching_groups[1:]:
-            target.extend(other)
-            groups.remove(other)
+        else:
+            matching_group.append(region)
 
     max_group_width = max(1, int(os.getenv("ARIA_GROUP_MAX_WIDTH", "280")))
     split: list[list[DetectedRegion]] = []
     for group in groups:
-        split.extend(_split_wide_group(group, max_group_width))
+        if _group_bubble(group, bubble_matches) is not None:
+            split.append(group)
+        else:
+            split.extend(_split_wide_group(group, max_group_width))
 
     grouped: list[DetectedRegion] = []
     for group in split:
+        bubble = _group_bubble(group, bubble_matches)
         if len(group) == 1:
-            grouped.append(group[0])
+            grouped.append(
+                _with_bubble_metadata(group[0], bubble, checked=locator is not None)
+            )
             continue
-        grouped.append(_merge_detected_regions(group))
+        grouped.append(
+            _merge_detected_regions(group, bubble, bubble_checked=locator is not None)
+        )
     return grouped
+
+
+def _annotate_single_regions(
+    regions: Sequence[DetectedRegion], image: np.ndarray | None
+) -> list[DetectedRegion]:
+    if image is None:
+        return list(regions)
+    locator = WhiteBubbleLocator(image)
+    annotated: list[DetectedRegion] = []
+    for region in regions:
+        geometry = polygon_geometry_mask(
+            image.shape, region.segmentation or [region.polygon]
+        )
+        annotated.append(
+            _with_bubble_metadata(region, locator.find(geometry), checked=True)
+        )
+    return annotated
+
+
+def _group_bubble(
+    group: Sequence[DetectedRegion],
+    bubble_matches: dict[int, BubbleMatch | None],
+) -> BubbleMatch | None:
+    matches = [bubble_matches.get(id(region)) for region in group]
+    present = [match for match in matches if match is not None]
+    if not present or any(match.id != present[0].id for match in present):
+        return None
+    return max(present, key=lambda match: match.bbox[2] * match.bbox[3])
+
+
+def _assign_unmatched_regions_to_bubbles(
+    regions: Sequence[DetectedRegion],
+    bubble_matches: dict[int, BubbleMatch | None],
+    locator: WhiteBubbleLocator,
+    image_shape: tuple[int, ...],
+) -> None:
+    known: dict[int, BubbleMatch] = {}
+    for match in bubble_matches.values():
+        if match is not None:
+            current = known.get(match.id)
+            if current is None or match.bbox[2] * match.bbox[3] > (
+                current.bbox[2] * current.bbox[3]
+            ):
+                known[match.id] = match
+
+    for region in regions:
+        if bubble_matches.get(id(region)) is not None:
+            continue
+        geometry = polygon_geometry_mask(
+            image_shape, region.segmentation or [region.polygon]
+        )
+        containing = [
+            match
+            for match in known.values()
+            if locator.geometry_overlap(match, geometry) >= 0.35
+            and len(match.contour) >= 3
+            and cv2.pointPolygonTest(
+                np.array(match.contour, dtype=np.int32),
+                (
+                    region.bbox[0] + region.bbox[2] / 2,
+                    region.bbox[1] + region.bbox[3] / 2,
+                ),
+                False,
+            )
+            >= 0
+        ]
+        if len(containing) == 1:
+            bubble_matches[id(region)] = containing[0]
+
+
+def _with_bubble_metadata(
+    region: DetectedRegion,
+    bubble: BubbleMatch | None,
+    *,
+    checked: bool = False,
+) -> DetectedRegion:
+    if bubble is None and not checked:
+        return region
+    metadata = dict(region.metadata)
+    metadata["bubble_checked"] = checked
+    if bubble is not None:
+        metadata["bubble_bbox"] = bubble.bbox
+        metadata["bubble_text_bbox"] = bubble.text_bbox
+        metadata["bubble_contour"] = bubble.contour
+        metadata["bubble_fill_tone"] = bubble.fill_tone
+    return replace(region, metadata=metadata)
 
 
 def _group_bbox_x_span(group: Sequence[DetectedRegion]) -> int:
@@ -506,7 +604,9 @@ def _keep_detected_region(region: DetectedRegion) -> bool:
     if not _contains_text_character(region.source_text):
         return False
     if region.metadata.get("provider") == "paddleocr":
-        return any(_is_japanese_character(character) for character in region.source_text)
+        return any(
+            _is_japanese_character(character) for character in region.source_text
+        )
     return True
 
 
@@ -520,7 +620,17 @@ def _is_japanese_character(character: str) -> bool:
     )
 
 
-def _regions_should_merge(first: DetectedRegion, second: DetectedRegion) -> bool:
+def _regions_should_merge(
+    first: DetectedRegion,
+    second: DetectedRegion,
+    first_bubble: BubbleMatch | None = None,
+    second_bubble: BubbleMatch | None = None,
+) -> bool:
+    if first_bubble is not None and second_bubble is not None:
+        return first_bubble.id == second_bubble.id
+    if first_bubble is not None or second_bubble is not None:
+        return False
+
     first_x, first_y, first_width, first_height = first.bbox
     second_x, second_y, second_width, second_height = second.bbox
     first_right = first_x + first_width
@@ -537,22 +647,51 @@ def _regions_should_merge(first: DetectedRegion, second: DetectedRegion) -> bool
     vertical_lines = first.orientation == second.orientation == "vertical"
     horizontal_lines = first.orientation == second.orientation == "horizontal"
     if vertical_lines:
-        return (
-            vertical_overlap / minimum_height >= 0.08
-            and horizontal_gap <= max(8, minimum_width * 2)
+        return vertical_overlap / minimum_height >= 0.35 and horizontal_gap <= max(
+            6, int(minimum_width * 1.25)
         )
     if horizontal_lines:
-        return (
-            horizontal_overlap / minimum_width >= 0.08
-            and vertical_gap <= max(8, minimum_height * 2)
+        return horizontal_overlap / minimum_width >= 0.35 and vertical_gap <= max(
+            6, int(minimum_height * 1.25)
         )
     return (
-        horizontal_overlap / minimum_width >= 0.08
-        and vertical_overlap / minimum_height >= 0.08
+        horizontal_overlap / minimum_width >= 0.35
+        and vertical_overlap / minimum_height >= 0.35
     )
 
 
-def _merge_detected_regions(group: Sequence[DetectedRegion]) -> DetectedRegion:
+def _merge_detected_regions(
+    group: Sequence[DetectedRegion],
+    bubble: BubbleMatch | None = None,
+    *,
+    bubble_checked: bool = False,
+) -> DetectedRegion:
+    vertical_count = sum(region.orientation == "vertical" for region in group)
+    orientation = "vertical" if vertical_count > len(group) / 2 else "horizontal"
+    ordered_group = sorted(
+        group,
+        key=(
+            (
+                lambda region: (
+                    -region.bbox[0],
+                    region.bbox[1],
+                    -region.bbox[3],
+                    -region.bbox[2],
+                    region.source_text or "",
+                )
+            )
+            if orientation == "vertical"
+            else (
+                lambda region: (
+                    region.bbox[1],
+                    region.bbox[0],
+                    -region.bbox[2],
+                    -region.bbox[3],
+                    region.source_text or "",
+                )
+            )
+        ),
+    )
     x1 = min(region.bbox[0] for region in group)
     y1 = min(region.bbox[1] for region in group)
     x2 = max(region.bbox[0] + region.bbox[2] for region in group)
@@ -565,7 +704,7 @@ def _merge_detected_regions(group: Sequence[DetectedRegion]) -> DetectedRegion:
     ]
     segmentations = [
         segmentation
-        for region in group
+        for region in ordered_group
         for segmentation in (region.segmentation or [region.polygon])
     ]
     confidences = [
@@ -578,8 +717,14 @@ def _merge_detected_regions(group: Sequence[DetectedRegion]) -> DetectedRegion:
         for region in group
         if region.detector_confidence is not None
     ]
-    metadata = dict(group[0].metadata)
+    metadata = dict(ordered_group[0].metadata)
     metadata["group_size"] = len(group)
+    metadata["bubble_checked"] = bubble_checked
+    if bubble is not None:
+        metadata["bubble_bbox"] = bubble.bbox
+        metadata["bubble_text_bbox"] = bubble.text_bbox
+        metadata["bubble_contour"] = bubble.contour
+        metadata["bubble_fill_tone"] = bubble.fill_tone
     return DetectedRegion(
         polygon=polygon,
         bbox=(x1, y1, x2 - x1, y2 - y1),
@@ -588,13 +733,15 @@ def _merge_detected_regions(group: Sequence[DetectedRegion]) -> DetectedRegion:
             if detector_confidences
             else None
         ),
-        orientation="vertical" if (y2 - y1) > (x2 - x1) else "horizontal",
+        orientation=orientation,
         source_text="\n".join(
             region.source_text.strip()
-            for region in group
+            for region in ordered_group
             if region.source_text and region.source_text.strip()
         ),
-        recognition_confidence=(sum(confidences) / len(confidences) if confidences else None),
+        recognition_confidence=(
+            sum(confidences) / len(confidences) if confidences else None
+        ),
         segmentation=segmentations,
         metadata=metadata,
     )
@@ -630,7 +777,7 @@ def _points_from_paddle(points: Any) -> list[Point]:
         if hasattr(point, "tolist"):
             point = point.tolist()
         if len(point) >= 2:
-            result.append(Point(x=int(round(point[0])), y=int(round(point[1]))))
+            result.append(Point(x=round(point[0]), y=round(point[1])))
     return result
 
 

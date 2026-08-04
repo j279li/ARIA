@@ -60,13 +60,18 @@ $env:ARIA_FONT_PATH = "C:\Windows\Fonts\arial.ttf"
 $env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
 ```
 
-The backend stores originals, cleaned images, translated images, OCR regions,
-and job state under `.aria-data/`. This directory is intentionally local and
-should not be committed.
+The backend stores originals, rendered images, and job state (including OCR
+regions) under `.aria-data/`. This directory is intentionally local and should
+not be committed.
 
-Completed pages can be edited in the frontend and rerendered through the fast
-page render endpoint. This changes translations and typesetting without
-running detection, recognition, or translation again.
+Completed pages can be manually cleaned in the frontend and rerendered without
+running detection, recognition, or translation again. Enclosed bubble contours
+are persisted so cleanup and body-centered text placement can reuse the detected
+shape without repeating connected-component analysis.
+
+Automatic cleanup first looks for white connected components. If that fails, a
+stricter OCR-seeded tone detector can accept enclosed cream or gray bubbles with
+dark outlines; unsupported regions remain untouched for manual cleanup.
 
 ## Provider Architecture
 
@@ -75,12 +80,9 @@ running detection, recognition, or translation again.
 - `TextDetector` returns page-coordinate polygons and detector confidence.
 - `TextRecognizer` returns one OCR result per detected region. Recognition
   confidence is optional because providers such as `manga-ocr` do not expose it.
-- `MaskProvider` converts detector polygons into an inpainting mask.
 
-The default adapter remains Tesseract plus `PolygonMaskProvider`, so installing
-the current lightweight dependencies behaves as before. A future
-`comic-text-detector` integration can implement the detector protocol without
-changing translation, cleanup, rendering, or the HTTP API.
+The default adapter remains Tesseract. A future comic-specific detector can
+implement the detector protocol without changing translation or rendering.
 
 ## Optional Providers
 
@@ -127,17 +129,16 @@ but its general-purpose model will usually be less natural than DeepL for manga
 dialogue.
 
 Helsinki OPUS-MT is a higher-quality local translation option. It uses the
-`Helsinki-NLP/opus-mt-ja-en` model via `transformers` and is preferred over
-Argos when available. Install with the `helsinki` extra and `sentencepiece`:
+`Helsinki-NLP/opus-mt-ja-en` model and is preferred over Argos when available:
 
 ```powershell
 pip install -e ".[helsinki]"
 ```
 
-To use a GPU for detection or translation, first install GPU-enabled packages:
+To use a GPU for PaddleOCR or Manga OCR, first install GPU-enabled packages:
 
 ```powershell
-# PyTorch with CUDA (for Manga OCR + Helsinki)
+# PyTorch with CUDA (for Manga OCR)
 python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # PaddlePaddle with CUDA (reinstall if CPU version is present)
@@ -156,6 +157,4 @@ All detector, recognizer, inpainting, and rendering work runs in this local
 Python process. DeepL is the only external processing option, and it is used
 only when selected and `DEEPL_API_KEY` is configured.
 
-Detector polygons and provider metadata are persisted in `regions.json`. The
-mask provider uses detector segmentation polygons when supplied, which leaves
-room for a future comic-specific detector with more detailed masks.
+Detector polygons and provider metadata are persisted in each job's state.
